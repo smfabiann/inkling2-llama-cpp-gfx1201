@@ -1809,7 +1809,8 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+        enum ggml_prec   prec) const {
     if (!w_s) {
         w_s = model.get_w_scale(w);
     }
@@ -1824,6 +1825,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
 
     prec_policy.apply(res);
+
+    if (prec != GGML_PREC_UNDEFINED) {
+        // explicit precision wins; set on the base MUL_MAT before scale/LoRA changes the root op
+        ggml_prec_set_acc(res, prec);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
