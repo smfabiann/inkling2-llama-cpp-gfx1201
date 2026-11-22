@@ -5123,6 +5123,74 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// (residual + GGML_OP_SSM_CONV)*scale (fused operation)
+struct test_ssm_conv_res_scale : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_RES_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, ne_b);
+    }
+
+    test_ssm_conv_res_scale(std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b)
+        : ne_a(ne_a), ne_b(ne_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * conv = ggml_ssm_conv(ctx, a, b);
+        ggml_tensor * res  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, conv->ne);
+        ggml_set_name(res, "res");
+
+        ggml_tensor * out = ggml_scale(ctx, ggml_add(ctx, res, conv), 0.4472136f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// (x - tanh(f)*x) + tanh(g)*m (fused operation)
+struct test_tanh_gate_mix : public test_case {
+    const std::array<int64_t, 2> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TANH_GATE_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_tanh_gate_mix(std::array<int64_t, 2> ne) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(x, "x");
+        ggml_set_name(f, "f");
+        ggml_set_name(g, "g");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, x, ggml_mul(ctx, ggml_tanh(ctx, f), x)), ggml_mul(ctx, ggml_tanh(ctx, g), m));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -9569,6 +9637,26 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+// ring-rotated K/V cells (wrapped SWA cache): the relative distance uses the logical cell index
+struct test_flash_attn_ext_banded_rot : public test_flash_attn_ext_banded_sinks {
+    const int32_t kv_rot;
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded_sinks::vars() + ",kv_rot=" + std::to_string(kv_rot);
+    }
+
+    test_flash_attn_ext_banded_rot(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, int sinks, int32_t kv_rot)
+        : test_flash_attn_ext_banded_sinks(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, GGML_TYPE_F32, sinks),
+          kv_rot(kv_rot) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded_sinks::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_kv_rot(out, kv_rot);
+        return out;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -12287,6 +12375,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t n_t : {1, 3, 64}) {
+        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 1024, 1, 1}, {4, 1024, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 256, 2, 1}, {4, 256, 1, 1}));
+    }
+    for (int64_t n_t : {1, 7, 512}) {
+        test_cases.emplace_back(new test_tanh_gate_mix({2304, n_t}));
+    }
+    test_cases.emplace_back(new test_tanh_gate_mix({100, 3}));
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 1, 1)); // Zamba2 decode (single-token, matches real per-token decode workload)
@@ -13849,6 +13946,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  6, 1,   17, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512,  4096, 1024, 2, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 2,  512,  4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
+        // Inkling-2-Mini shapes: GQA 3 (24/8), SWA and full-attention n_kv, odd n_q, F16 and Q8_0 caches (AMD WMMA banded path)
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  1536, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  509,  1536, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,    1,  8704, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, sinks));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   37,  2048, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, sinks));
+        for (int32_t rot : {1, 511, 1024, 1535}) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, rot));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 512, 1536, 1024, 1, GGML_TYPE_F16,  sinks, rot));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_banded_rot(128, 24, 8, 100, 1536, 1024, 1, GGML_TYPE_Q8_0, sinks, 700));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1, 2048,  2048, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
         test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128,  8, 1,  511, 16403, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32,  sinks));
     }
@@ -14281,6 +14389,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini banded attention, one prefill ubatch: SWA (n_kv 1536) and full attention (n_kv 8704), Q8_0 cache
+    for (int64_t n_kv : {1536, 8704}) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 512, n_kv, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

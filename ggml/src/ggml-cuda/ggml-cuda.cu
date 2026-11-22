@@ -4325,6 +4325,70 @@ static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     return n - 1;
 }
 
+// CONCAT(past, cur) -> VIEW(last) -> VIEW(state cell) -> CPY(last, cell) -> SSM_CONV -> ADD(res) -> SCALE
+static int ggml_cuda_try_fuse_ssm_conv_hist(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const ggml_op ops[7] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE };
+    const int n = 7;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor ** nd = cgraph->nodes + i;
+    for (int k = 0; k < n; ++k) {
+        if (nd[k]->op != ops[k] || (nd[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+    }
+    if (nd[1]->view_src != nd[0] || nd[3]->src[0] != nd[1] || nd[3]->src[1] != nd[2] || nd[4]->src[0] != nd[0] ||
+        (nd[5]->src[0] != nd[4] && nd[5]->src[1] != nd[4]) || nd[6]->src[0] != nd[5]) {
+        return 0;
+    }
+    // the concat feeds the stored view and the conv only, the last view the copy only, and the conv and the add
+    // their next node only; the cell view and the copy are views of and writes to the state
+    if (ggml_node_get_use_count(cgraph, i) != 2 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1 || ggml_node_get_use_count(cgraph, i + 3) != 0 ||
+        ggml_node_get_use_count(cgraph, i + 4) != 1 || ggml_node_get_use_count(cgraph, i + 5) != 1) {
+        return 0;
+    }
+    for (int k : { 0, 1, 4, 5 }) {
+        if (nd[k]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_ssm_conv_hist_supported(nd)) {
+        return 0;
+    }
+    ggml_cuda_op_ssm_conv_hist(*cuda_ctx, nd);
+    return n - 1;
+}
+
+// y = (x - tanh(f)*x) + tanh(g)*m, rows of ne0 floats with per-operand row strides
+static __global__ void k_tanh_gate_mix(const float * x, const float * f, const float * g, const float * m, float * y,
+        const int64_t ne0, const int64_t nrows, const int64_t sx, const int64_t sf, const int64_t sg, const int64_t sm, const int64_t sy) {
+    const int64_t i0  = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y;
+    if (i0 >= ne0 || row >= nrows) {
+        return;
+    }
+    const float xv = x[row*sx + i0];
+    const float a  = __fsub_rn(xv, __fmul_rn(tanhf(f[row*sf + i0]), xv));
+    const float b  = __fmul_rn(tanhf(g[row*sg + i0]), m[row*sm + i0]);
+    y[row*sy + i0] = __fadd_rn(a, b);
+}
+
+static void ggml_cuda_op_tanh_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * const * n) {
+    const ggml_tensor * x = n[2]->src[0];
+    const ggml_tensor * m = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
+    const ggml_tensor * f = n[0]->src[0];
+    const ggml_tensor * g = n[3]->src[0];
+    ggml_tensor * y = n[5];
+    const int64_t ne0 = y->ne[0], nrows = y->ne[1];
+    const int threads = 256;
+    const dim3 grid((ne0 + threads - 1)/threads, nrows, 1);
+    k_tanh_gate_mix<<<grid, threads, 0, ctx.stream()>>>((const float *) x->data, (const float *) f->data, (const float *) g->data,
+            (const float *) m->data, (float *) y->data, ne0, nrows,
+            x->nb[1]/sizeof(float), f->nb[1]/sizeof(float), g->nb[1]/sizeof(float), m->nb[1]/sizeof(float), y->nb[1]/sizeof(float));
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4434,6 +4498,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    std::initializer_list<enum ggml_op> tanh_gate_mix_ops = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+    if (is_equal(tanh_gate_mix_ops, ops)) {
+        // (x - tanh(f)*x) + tanh(g)*m
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 5 })) {
+            return false;
+        }
+        const ggml_tensor * const * n = cgraph->nodes + node_idx;
+        if (ggml_get_unary_op(n[0]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_TANH) {
+            return false;
+        }
+        if ((n[1]->src[0] != n[0] && n[1]->src[1] != n[0]) || n[2]->src[1] != n[1] ||
+            (n[4]->src[0] != n[3] && n[4]->src[1] != n[3]) ||
+            !((n[5]->src[0] == n[2] && n[5]->src[1] == n[4]) || (n[5]->src[0] == n[4] && n[5]->src[1] == n[2]))) {
+            return false;
+        }
+        const ggml_tensor * x  = n[2]->src[0];
+        const ggml_tensor * x1 = n[1]->src[0] == n[0] ? n[1]->src[1] : n[1]->src[0];
+        const ggml_tensor * m  = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
+        const ggml_tensor * f  = n[0]->src[0];
+        const ggml_tensor * g  = n[3]->src[0];
+        if (x1->data != x->data || memcmp(x1->nb, x->nb, sizeof(x->nb)) != 0) {
+            return false;
+        }
+        const ggml_tensor * out = n[5];
+        for (const ggml_tensor * t : { x, m, f, g, out, n[0], n[1], n[2], n[3], n[4] }) {
+            if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, out) || t->nb[0] != sizeof(float) || t->ne[2] != 1 || t->ne[3] != 1) {
+                return false;
+            }
+        }
+        // each thread reads its element of every input before writing the same element of the output, so an input
+        // may share the output memory only element for element
+        const char * y0 = (const char *) out->data;
+        const char * y1 = y0 + ggml_nbytes(out);
+        for (const ggml_tensor * t : { x, m, f, g }) {
+            const char * t0 = (const char *) t->data;
+            const char * t1 = t0 + ggml_nbytes(t);
+            if (t0 < y1 && y0 < t1 && !(t0 == y0 && t->nb[1] == out->nb[1])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4530,6 +4637,37 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
 
         return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD && ops.begin()[2] == GGML_OP_SCALE) {
+        // (residual + ssm_conv)*scale with a residual of the conv output shape
+        if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+            return false;
+        }
+        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+        const ggml_tensor * add      = cgraph->nodes[node_idx+1];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx+2];
+        if (add->src[0] != ssm_conv && add->src[1] != ssm_conv) {
+            return false;
+        }
+        if (scale->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * res = add->src[0] == ssm_conv ? add->src[1] : add->src[0];
+        // the conv reads several inputs per output, so the output must not share the conv input memory; the residual
+        // is read element for element and may be the output memory itself
+        const ggml_tensor * x = ssm_conv->src[0];
+        const char * y0 = (const char *) scale->data, * y1 = y0 + ggml_nbytes(scale);
+        const char * x0 = (const char *) x->data,     * x1 = x0 + ggml_nbytes(x);
+        const char * r0 = (const char *) res->data,   * r1 = r0 + ggml_nbytes(res);
+        if ((x0 < y1 && y0 < x1) || (r0 < y1 && y0 < r1 && r0 != y0)) {
+            return false;
+        }
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        return bias == 0.0f && ssm_conv->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+               res->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_are_same_shape(res, ssm_conv) &&
+               ggml_are_same_shape(add, ssm_conv) && ggml_is_contiguous(scale);
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD
@@ -4897,6 +5035,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_SCALE) {
         static const bool situ_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SITU_FUSION");
         const int n_fused = situ_disabled ? 0 : ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    // short convolution with its past in the recurrent state
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool ssm_conv_hist_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SSM_CONV_HIST_FUSION");
+        const int n_fused = ssm_conv_hist_disabled ? 0 : ggml_cuda_try_fuse_ssm_conv_hist(cuda_ctx, cgraph, i);
         if (n_fused > 0) {
             return n_fused;
         }
@@ -5572,6 +5719,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD },
+                { GGML_UNARY_OP_TANH, GGML_UNARY_OP_TANH })) {
+        ggml_cuda_op_tanh_gate_mix(*cuda_ctx, cgraph->nodes + i);
+        return 5;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE }, {})) {
+        ggml_cuda_op_ssm_conv(*cuda_ctx, node, nullptr, nullptr, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {

@@ -239,6 +239,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
+    if (scores->ne[1] == 1) {
+        // one query: out[e,t] = sum_b states_t[b,e,t]*scores[b,t] as a broadcast multiply and a row sum. As a GEMM it
+        // is n_tokens batched 2304x1xB products, which BLAS libraries run poorly (hipBLASLt leaves the GPU idle)
+        ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, states_t, scores));
+        return ggml_reshape_3d(ctx0, out, n_embd, 1, n_tokens);
+    }
+
     return ggml_mul_mat(ctx0, states_t, scores);
 }
 
@@ -259,15 +266,27 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
+    // created first so that the residual add follows the conv directly in the graph, which lets a backend fuse
+    // the conv, the residual add and the scale
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
+
+    ggml_tensor * x = ggml_transpose(ctx0, cur_3d);
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+
+    if (!dynamic) {
+        out = ggml_scale(ctx0, ggml_add(ctx0, cur_3d, out), 1.0f/sqrtf(n_conv + 1));
+        // right after the state store, so that a backend can fuse the input concat, the store and the conv
+        ggml_build_forward_expand(gf, out);
+        return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    }
+
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 
-    if (dynamic) {
+    {
         const int64_t n_heads = dynamic->ne[0]/n_conv;
 
         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
@@ -287,7 +306,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(2*n_conv + 1));
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
@@ -297,8 +316,17 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gain_pre   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget_pre = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+
+    // the projections and the message first, so that the elementwise tail is contiguous in the graph and a backend
+    // can fuse it
+    ggml_build_forward_expand(gf, forget_pre);
+    ggml_build_forward_expand(gf, gain_pre);
+    ggml_build_forward_expand(gf, message);
+
+    ggml_tensor * gain   = ggml_tanh(ctx0, gain_pre);
+    ggml_tensor * forget = ggml_tanh(ctx0, forget_pre);
 
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
@@ -327,11 +355,17 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     const int64_t nh  = hparams.n_head(il);
     const int64_t nkv = hparams.n_head_kv(il);
     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
-    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
-    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+    // a ring-rotated cache needs a kernel that maps cells to logical distances: probe with a rotation then,
+    // at a padded cell count (256) so the probe meets the layout conditions of such kernels
+    const int64_t pn  = inp->kv_rot_banded[swa] ? 256 : 1;
+    ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, pn, nkv, 1);
+    ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, pn, nkv, 1);
+    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+    if (inp->kv_rot_banded[swa]) {
+        ggml_flash_attn_ext_banded_set_kv_rot(op, 1);
+    }
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
     ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = ggml_backend_dev_supports_op(dev, op);
@@ -347,7 +381,31 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
+        inp->n_kv_banded[i] = inp->n_kv_banded_raw[i] = cache->get_n_kv_pos_ring(inp->kv_rot_banded_raw[i]);
+        inp->kv_rot_banded[i] = inp->kv_rot_banded_raw[i];
+        inp->n_kv_banded_mask[i] = cache->get_n_kv();
+        // pad an unrotated cell count to the FA KV stride: kernels that need it (the WMMA path) can then run. The
+        // extra cells hold no position of this sequence, so the mask hides them, and a rotation of n keeps the
+        // queries aligned to the tail of the real cells: logical index (cell - n) mod n_pad = cell + n_pad - n.
+        const uint32_t n   = inp->n_kv_banded[i];
+        const uint32_t pad = GGML_PAD(n, 256u);
+        if (n > 0 && inp->kv_rot_banded[i] == 0 && pad != n && pad <= inp->n_kv_banded_mask[i]) {
+            inp->n_kv_banded[i]   = pad;
+            inp->kv_rot_banded[i] = n;
+            // a backend without rotated banded attention keeps the unpadded layout instead of falling back to dense
+            int il_rep = -1;
+            for (int il = 0; il < n_layer && il_rep < 0; ++il) {
+                if (hparams.is_swa(il) == (i == 1)) {
+                    il_rep = il;
+                }
+            }
+            if (il_rep >= 0 && !use_banded(il_rep, i == 1)) {
+                inp->n_kv_banded[i]   = n;
+                inp->kv_rot_banded[i] = 0;
+                banded_dev_ok.clear();
+            }
+        }
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -504,9 +562,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         mask->nb[1], mask->nb[2], mask->nb[3], 0));
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
-            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+            // one GEMM over all heads and tokens instead of a batch of n_tokens small ones (same bias matrix)
+            ggml_tensor * R2 = ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur);
+            R2 = ggml_reshape_2d(ctx0, R2, R2->ne[0], R2->ne[1]*R2->ne[2]);
+            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, R2);
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+            if (inp->kv_rot_banded[is_swa]) {
+                ggml_flash_attn_ext_banded_set_kv_rot(cur, inp->kv_rot_banded[is_swa]);
+            }
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
