@@ -2,10 +2,11 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+static constexpr int64_t n_kq_bias_max  = int64_t(1) << 25;
 static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
@@ -331,6 +332,26 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
 
+static bool inkling2_banded_small_long_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_INKLING2_BANDED_SMALL_LONG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool inkling2_banded_decode_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_INKLING2_BANDED_DECODE");
+#if defined(GGML_USE_HIP)
+        return env != nullptr && std::atoi(env) != 0;
+#else
+        return env == nullptr || std::atoi(env) != 0;
+#endif
+    }();
+    return enabled;
+}
+
 bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
     const int64_t hd = hparams.n_embd_head_k(il);
@@ -360,11 +381,14 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     const int64_t pn  = inp->kv_rot_banded[swa] ? 256 : 1;
     ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, pn, nkv, 1);
     ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, pn, nkv, 1);
-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
+    ggml_tensor * pm = inp->banded_decode ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pn, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
     if (inp->kv_rot_banded[swa]) {
         ggml_flash_attn_ext_banded_set_kv_rot(op, 1);
+    }
+    if (inp->banded_decode) {
+        ggml_flash_attn_ext_banded_add_pos(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1));
     }
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
     ggml_prec_set_acc(op, GGML_PREC_F32);
@@ -378,11 +402,38 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     attn = inp->get_attn();
     recr = inp->get_recr();
 
-    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
-    inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+    // banded FA needs a position-contiguous cache; single-token decode uses padded n_kv + device inp_pos
+    // on global layers once n_kv >= 4096 (when c0 == 0, so >75% of tiles hit the zero-mask zero-rel fast path).
+    // Small/medium batches (2..32 tokens) on long global caches (>= 4096) can also use banded MMA on global layers.
+    inp->banded_decode      = inkling2_banded_decode_enabled() && cparams.flash_attn && n_tokens == 1 && ubatch.n_seqs == 1;
+    const bool banded_small_long = inkling2_banded_small_long_enabled() &&
+        cparams.flash_attn && n_tokens > 1 && n_tokens <= n_tokens_banded_min;
+    inp->banded_global_only = banded_small_long;
+    inp->banded             = cparams.flash_attn && (n_tokens > n_tokens_banded_min || inp->banded_decode || banded_small_long);
     for (int i = 0; i < 2 && inp->banded; ++i) {
         const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
+        if (inp->banded_decode) {
+            if (i == 0) {
+                const uint32_t n_contig = cache->get_n_kv_pos_contiguous();
+                const uint32_t n_kv_c   = cache->get_n_kv();
+                const bool     c0_zero  = ubatch.pos != nullptr && ubatch.pos[0] >= 0 && n_contig == (uint32_t) ubatch.pos[0] + 1;
+                if (c0_zero && n_kv_c >= 4096) {
+                    inp->n_kv_banded[0]      = inp->n_kv_banded_raw[0]  = n_kv_c;
+                    inp->kv_rot_banded[0]    = inp->kv_rot_banded_raw[0] = 0;
+                    inp->n_kv_banded_mask[0] = n_kv_c;
+                }
+            }
+            continue;
+        }
+        if (banded_small_long && i == 1) {
+            continue;
+        }
         inp->n_kv_banded[i] = inp->n_kv_banded_raw[i] = cache->get_n_kv_pos_ring(inp->kv_rot_banded_raw[i]);
+        if (banded_small_long && inp->n_kv_banded[i] < 4096) {
+            inp->n_kv_banded[i]      = inp->n_kv_banded_raw[i]  = 0;
+            inp->kv_rot_banded[i]    = inp->kv_rot_banded_raw[i] = 0;
+            continue;
+        }
         inp->kv_rot_banded[i] = inp->kv_rot_banded_raw[i];
         inp->n_kv_banded_mask[i] = cache->get_n_kv();
         // pad an unrotated cell count to the FA KV stride: kernels that need it (the WMMA path) can then run. The
@@ -409,6 +460,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     }
 
     ggml_tensor * inp_pos = build_inp_pos();
+    inp_pos_t = inp_pos;
     inp_out_ids = build_inp_out_ids();
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
@@ -555,11 +607,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
             ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-            // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
-            ggml_tensor *& m = mask_banded[is_swa];
-            if (!m) {
-                m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
+            ggml_tensor * m = nullptr;
+            if (!(inp->banded_decode && !is_swa)) {
+                // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
+                ggml_tensor *& mb = mask_banded[is_swa];
+                if (!mb) {
+                    mb = (n_kv_b == mask->ne[0] && ggml_is_contiguous(mask))
+                        ? mask
+                        : ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                                mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                }
+                m = mb;
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
             // one GEMM over all heads and tokens instead of a batch of n_tokens small ones (same bias matrix)
@@ -572,6 +630,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 ggml_flash_attn_ext_banded_set_kv_rot(cur, inp->kv_rot_banded[is_swa]);
             }
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+            if (inp->banded_decode && !is_swa) {
+                ggml_flash_attn_ext_banded_add_pos(cur, inp_pos_t);
+            }
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
@@ -602,7 +663,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                     (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
             if (n_rows_max < n_seq_tokens) {
                 const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-                n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+                const int64_t chunk_rows = (n_seq_tokens + n_chunks - 1)/n_chunks;
+                n_rows_max = std::min(n_seq_tokens, chunk_rows >= 64 ? GGML_PAD(chunk_rows, 64) : chunk_rows);
             }
             auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                 int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };

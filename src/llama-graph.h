@@ -827,7 +827,9 @@ public:
     uint32_t n_kv_banded_raw[2]  = { 0, 0 };
     uint32_t kv_rot_banded_raw[2] = { 0, 0 };
     uint32_t n_kv_banded_mask[2]  = { 0, 0 }; // mask width (cells) the padding was decided against
-    bool     banded         = false;
+    bool     banded               = false;
+    bool     banded_decode        = false;
+    bool     banded_global_only   = false;
 
     const uint32_t extent;
     const uint32_t extent_swa;
