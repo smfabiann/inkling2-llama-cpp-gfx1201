@@ -4976,6 +4976,74 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// (residual + GGML_OP_SSM_CONV)*scale (fused operation)
+struct test_ssm_conv_res_scale : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_RES_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, ne_b);
+    }
+
+    test_ssm_conv_res_scale(std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b)
+        : ne_a(ne_a), ne_b(ne_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * conv = ggml_ssm_conv(ctx, a, b);
+        ggml_tensor * res  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, conv->ne);
+        ggml_set_name(res, "res");
+
+        ggml_tensor * out = ggml_scale(ctx, ggml_add(ctx, res, conv), 0.4472136f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// (x - tanh(f)*x) + tanh(g)*m (fused operation)
+struct test_tanh_gate_mix : public test_case {
+    const std::array<int64_t, 2> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TANH_GATE_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_tanh_gate_mix(std::array<int64_t, 2> ne) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(x, "x");
+        ggml_set_name(f, "f");
+        ggml_set_name(g, "g");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, x, ggml_mul(ctx, ggml_tanh(ctx, f), x)), ggml_mul(ctx, ggml_tanh(ctx, g), m));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12087,6 +12155,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    for (int64_t n_t : {1, 3, 64}) {
+        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 1024, 1, 1}, {4, 1024, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv_res_scale({3 + n_t, 256, 2, 1}, {4, 256, 1, 1}));
+    }
+    for (int64_t n_t : {1, 7, 512}) {
+        test_cases.emplace_back(new test_tanh_gate_mix({2304, n_t}));
+    }
+    test_cases.emplace_back(new test_tanh_gate_mix({100, 3}));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 64, 64, 112, 2, 32, 4)); // Zamba2 (real hparams: d_inner=7168, dt_rank=112, n_group=2 -> head_dim=7168/112=64)

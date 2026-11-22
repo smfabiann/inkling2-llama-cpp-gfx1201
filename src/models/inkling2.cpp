@@ -266,15 +266,25 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
+    // created first so that the residual add follows the conv directly in the graph, which lets a backend fuse
+    // the conv, the residual add and the scale
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
+
+    ggml_tensor * x = ggml_transpose(ctx0, cur_3d);
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+
+    if (!dynamic) {
+        out = ggml_scale(ctx0, ggml_add(ctx0, cur_3d, out), 1.0f/sqrtf(n_conv + 1));
+        return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    }
+
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 
-    if (dynamic) {
+    {
         const int64_t n_heads = dynamic->ne[0]/n_conv;
 
         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
@@ -294,7 +304,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf(2*n_conv + 1));
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
@@ -304,8 +314,17 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gain_pre   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget_pre = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+
+    // the projections and the message first, so that the elementwise tail is contiguous in the graph and a backend
+    // can fuse it
+    ggml_build_forward_expand(gf, forget_pre);
+    ggml_build_forward_expand(gf, gain_pre);
+    ggml_build_forward_expand(gf, message);
+
+    ggml_tensor * gain   = ggml_tanh(ctx0, gain_pre);
+    ggml_tensor * forget = ggml_tanh(ctx0, forget_pre);
 
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
