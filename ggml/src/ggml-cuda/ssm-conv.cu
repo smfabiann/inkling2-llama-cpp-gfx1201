@@ -225,3 +225,156 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// short convolution over [past, cur] with the past (d_conv - 1 columns per channel) read from the recurrent state, a
+// residual add and a scale, and the new past written back: CONCAT -> VIEW -> VIEW -> CPY -> SSM_CONV -> ADD -> SCALE
+// one thread per channel and sequence, so the state may be read and written in place
+template <size_t d_conv>
+static __global__ void ssm_conv_hist_f32(
+        const float * __restrict__ past, const int64_t past_s1, const int64_t past_s2,
+        const float * cur, const int64_t cur_s0, const int64_t cur_s1, const int64_t cur_s2,
+        const float * __restrict__ w_ptr, const int64_t w_s1,
+        const float * res, const int64_t res_s1, const int64_t res_s2, const float res_scale,
+        float * y, const int64_t y_s1, const int64_t y_s2,
+        float * state, const int64_t state_s1,
+        const int64_t nr, const int64_t n_t) {
+    const int64_t c = (int64_t) blockIdx.y*blockDim.x + threadIdx.x;
+    const int64_t s = blockIdx.x;
+    if (c >= nr) {
+        return;
+    }
+
+    float x[d_conv];
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_ptr[c*w_s1 + j];
+    }
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        x[j] = past[s*past_s2 + c*past_s1 + j];
+    }
+    const float b = 0.0f;
+
+    for (int64_t i = 0; i < n_t; i++) {
+        x[d_conv - 1] = cur[s*cur_s2 + i*cur_s0 + c*cur_s1];
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[j] * w[j];
+        }
+        sumf += b;
+        sumf = (res[s*res_s2 + i*res_s1 + c] + sumf) * res_scale;
+        y[s*y_s2 + i*y_s1 + c] = sumf;
+
+#pragma unroll
+        for (size_t j = 0; j < d_conv - 1; j++) {
+            x[j] = x[j + 1];
+        }
+    }
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        state[s*state_s1 + c*(d_conv - 1) + j] = x[j];
+    }
+}
+
+bool ggml_cuda_ssm_conv_hist_supported(ggml_tensor * const * n) {
+    const ggml_tensor * concat = n[0];
+    const ggml_tensor * cpy    = n[3];
+    const ggml_tensor * conv   = n[4];
+    const ggml_tensor * add    = n[5];
+    const ggml_tensor * scale  = n[6];
+    const ggml_tensor * past   = concat->src[0];
+    const ggml_tensor * cur    = concat->src[1];
+    const ggml_tensor * w      = conv->src[1];
+    const ggml_tensor * res    = add->src[0] == conv ? add->src[1] : add->src[0];
+    const ggml_tensor * last   = cpy->src[0];
+    const ggml_tensor * cell   = cpy->src[1];
+
+    const int64_t nc  = w->ne[0];
+    const int64_t nr  = conv->ne[0];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+
+    if (nc != 4 || n_t > 32 || ggml_get_op_params_i32(concat, 0) != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : { concat, past, cur, w, res, last, cell, conv, add, scale }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // the inputs: the past [nc - 1, nr, n_s] and cur [n_t, nr, n_s], each with contiguous rows of past or one element
+    if (past->ne[0] != nc - 1 || past->ne[1] != nr || past->ne[2] != n_s || past->nb[0] != sizeof(float) ||
+        cur->ne[0] != n_t || cur->ne[1] != nr || cur->ne[2] != n_s || concat->ne[0] != nc - 1 + n_t || !ggml_is_contiguous(concat)) {
+        return false;
+    }
+    // the stored past is the last nc - 1 columns of the conv input, copied into nr*(nc - 1) contiguous floats per sequence
+    if (last->view_src != concat || last->view_offs != (size_t) n_t*sizeof(float) || last->ne[0] != nc - 1 ||
+        last->ne[1] != nr || last->ne[2] != n_s || last->nb[1] != concat->nb[1] || last->nb[2] != concat->nb[2] ||
+        cell->ne[0] != (nc - 1)*nr || cell->ne[1] != n_s || cell->nb[0] != sizeof(float) || ggml_nelements(cell) != ggml_nelements(last)) {
+        return false;
+    }
+    if (!ggml_are_same_shape(res, conv) || !ggml_is_contiguous(res) || !ggml_is_contiguous(scale) || w->nb[0] != sizeof(float)) {
+        return false;
+    }
+    float bias;
+    memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+    if (bias != 0.0f) {
+        return false;
+    }
+
+    // memory: the output may be the residual itself (element for element); the state may be the past itself (one
+    // thread reads its channel before it writes it), otherwise no overlaps between written and read memory
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    if ((overlap(scale, res) && scale->data != res->data) || overlap(scale, past) || overlap(scale, w) || overlap(scale, cell)) {
+        return false;
+    }
+    if (overlap(scale, cur) && !(scale->data == cur->data && cur->nb[1] == sizeof(float) && cur->nb[0] == scale->nb[1] &&
+                                 cur->nb[2] == scale->nb[2])) {
+        return false;
+    }
+    if ((overlap(cell, past) && !(cell->data == past->data && n_s == 1 && past->nb[1] == (nc - 1)*sizeof(float))) ||
+        overlap(cell, cur) || overlap(cell, res) || overlap(cell, w)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_op_ssm_conv_hist(ggml_backend_cuda_context & ctx, ggml_tensor * const * n) {
+    const ggml_tensor * concat = n[0];
+    const ggml_tensor * cpy    = n[3];
+    const ggml_tensor * conv   = n[4];
+    const ggml_tensor * add    = n[5];
+    ggml_tensor       * scale  = n[6];
+    const ggml_tensor * past   = concat->src[0];
+    const ggml_tensor * cur    = concat->src[1];
+    const ggml_tensor * w      = conv->src[1];
+    const ggml_tensor * res    = add->src[0] == conv ? add->src[1] : add->src[0];
+    const ggml_tensor * cell   = cpy->src[1];
+
+    float res_scale;
+    memcpy(&res_scale, scale->op_params, sizeof(float));
+
+    const int64_t nr  = conv->ne[0];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+
+    const int threads = 128;
+    const dim3 blocks(n_s, (nr + threads - 1)/threads, 1);
+    const size_t f = sizeof(float);
+    ssm_conv_hist_f32<4><<<blocks, threads, 0, ctx.stream()>>>(
+        (const float *) past->data, past->nb[1]/f, past->nb[2]/f,
+        (const float *) cur->data, cur->nb[0]/f, cur->nb[1]/f, cur->nb[2]/f,
+        (const float *) w->data, w->nb[1]/f,
+        (const float *) res->data, res->nb[1]/f, res->nb[2]/f, res_scale,
+        (float *) scale->data, scale->nb[1]/f, scale->nb[2]/f,
+        (float *) cell->data, cell->nb[1]/f,
+        nr, n_t);
+}

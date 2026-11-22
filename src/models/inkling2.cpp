@@ -279,6 +279,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     if (!dynamic) {
         out = ggml_scale(ctx0, ggml_add(ctx0, cur_3d, out), 1.0f/sqrtf(n_conv + 1));
+        // right after the state store, so that a backend can fuse the input concat, the store and the conv
+        ggml_build_forward_expand(gf, out);
         return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
     }
 

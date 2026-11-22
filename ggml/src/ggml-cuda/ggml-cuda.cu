@@ -4198,6 +4198,42 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// CONCAT(past, cur) -> VIEW(last) -> VIEW(state cell) -> CPY(last, cell) -> SSM_CONV -> ADD(res) -> SCALE
+static int ggml_cuda_try_fuse_ssm_conv_hist(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const ggml_op ops[7] = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE };
+    const int n = 7;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor ** nd = cgraph->nodes + i;
+    for (int k = 0; k < n; ++k) {
+        if (nd[k]->op != ops[k] || (nd[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+    }
+    if (nd[1]->view_src != nd[0] || nd[3]->src[0] != nd[1] || nd[3]->src[1] != nd[2] || nd[4]->src[0] != nd[0] ||
+        (nd[5]->src[0] != nd[4] && nd[5]->src[1] != nd[4]) || nd[6]->src[0] != nd[5]) {
+        return 0;
+    }
+    // the concat feeds the stored view and the conv only, the last view the copy only, and the conv and the add
+    // their next node only; the cell view and the copy are views of and writes to the state
+    if (ggml_node_get_use_count(cgraph, i) != 2 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1 || ggml_node_get_use_count(cgraph, i + 3) != 0 ||
+        ggml_node_get_use_count(cgraph, i + 4) != 1 || ggml_node_get_use_count(cgraph, i + 5) != 1) {
+        return 0;
+    }
+    for (int k : { 0, 1, 4, 5 }) {
+        if (nd[k]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_ssm_conv_hist_supported(nd)) {
+        return 0;
+    }
+    ggml_cuda_op_ssm_conv_hist(*cuda_ctx, nd);
+    return n - 1;
+}
+
 // y = (x - tanh(f)*x) + tanh(g)*m, rows of ne0 floats with per-operand row strides
 static __global__ void k_tanh_gate_mix(const float * x, const float * f, const float * g, const float * m, float * y,
         const int64_t ne0, const int64_t nrows, const int64_t sx, const int64_t sf, const int64_t sg, const int64_t sm, const int64_t sy) {
@@ -4759,6 +4795,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // short convolution with its past in the recurrent state
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool ssm_conv_hist_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SSM_CONV_HIST_FUSION");
+        const int n_fused = ssm_conv_hist_disabled ? 0 : ggml_cuda_try_fuse_ssm_conv_hist(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
