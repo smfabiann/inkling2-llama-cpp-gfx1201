@@ -239,6 +239,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
+    if (scores->ne[1] == 1) {
+        // one query: out[e,t] = sum_b states_t[b,e,t]*scores[b,t] as a broadcast multiply and a row sum. As a GEMM it
+        // is n_tokens batched 2304x1xB products, which BLAS libraries run poorly (hipBLASLt leaves the GPU idle)
+        ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, states_t, scores));
+        return ggml_reshape_3d(ctx0, out, n_embd, 1, n_tokens);
+    }
+
     return ggml_mul_mat(ctx0, states_t, scores);
 }
 
@@ -534,7 +541,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                         mask->nb[1], mask->nb[2], mask->nb[3], 0));
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
-            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
+            // one GEMM over all heads and tokens instead of a batch of n_tokens small ones (same bias matrix)
+            ggml_tensor * R2 = ggml_is_contiguous(Rcur) ? Rcur : ggml_cont(ctx0, Rcur);
+            R2 = ggml_reshape_2d(ctx0, R2, R2->ne[0], R2->ne[1]*R2->ne[2]);
+            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, R2);
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
             if (inp->kv_rot_banded[is_swa]) {
