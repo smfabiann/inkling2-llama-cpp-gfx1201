@@ -113,10 +113,10 @@ static __global__ void mul_mat_vec_f(
     if constexpr (has_fusion) {
         const int channel_bias = ids ? channel_x : channel_dst;
         if (use_bias) {
-            x_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+            x_bias += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_bias)*stride_channel_dst;
         }
         if (use_gate_bias) {
-            gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+            gate_bias += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_bias)*stride_channel_dst;
         }
     }
 
